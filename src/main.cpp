@@ -30,8 +30,8 @@ OneWire oneWire2(ONE_WIRE_BUS2);
 DallasTemperature sensors(&oneWire);
 DallasTemperature sensors2(&oneWire2);
 
-String ssid = "";//"Keenetic-6768";
-String password = "";//"factory86!ttl";
+String ssid = "";
+String password = "";
 const String MODE_IDLE = "idle";
 const String MODE_MANUAL = "manual";
 const String MODE_AUTO = "auto";
@@ -50,14 +50,14 @@ bool isNeedConfirm = false;
 bool isHeatBlock = false;
 String confirmMessage = "";
 
-// 0 - Нагрев до температуы внесение солода
+// 0 - Нагрев до температуры внесение солода
 // 1 - Ожидание внесение солода
 // 2 - Нагрев до следующей температурной паузы
 // 3 - Удержание температурной паузы
 // 4 - Ожидание фильтрации сусла
-// 5 - Нагрев до кипичение
-// 6 - Кипичение
-// 7 - Завршение программы
+// 5 - Нагрев до кипячение
+// 6 - Кипячение
+// 7 - Завершение программы
 int stage = 0;
 int step = 0;
 unsigned long lastTime;
