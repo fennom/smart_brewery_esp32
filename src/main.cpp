@@ -338,7 +338,7 @@ boolean writeFile(fs::FS &fs, const char * path, const char * message) {
 void getInfo() {
   jsonDocument.clear();
   jsonDocument["mode"] = mode;
-  jsonDocument["temparature"] = temperature;
+  jsonDocument["temperature"] = temperature;
   jsonDocument["heatTemperature"] = heatTemperature;
   jsonDocument["targetTemperature"] = targetTemperature;
   jsonDocument["heatLimit"] = heatLimit;
