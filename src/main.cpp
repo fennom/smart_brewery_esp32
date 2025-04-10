@@ -14,13 +14,12 @@
 #define ONE_WIRE_BUS 15
 #define ONE_WIRE_BUS2 2
 #define HEAT_PIN 22
-
 #define PUMP_PIN 22
 
 const int SENSOR_PERIOD = 2000;
 const int PID_DT = 1000;
 const int PUMP_DT = 100;
-const int SAVE_DT = 1000;
+const int SAVE_DT = 60000;
 
 WebServer server(80);
 StaticJsonDocument<1024> jsonDocument;
@@ -36,6 +35,9 @@ const String MODE_IDLE = "idle";
 const String MODE_MANUAL = "manual";
 const String MODE_AUTO = "auto";
 
+const char *pathSettings = "/settings.txt";
+const char *pathState = "/state.txt";
+
 char buffer[1024];
 String mode = MODE_IDLE;
 float temperature = 0;
@@ -48,6 +50,7 @@ bool isPumpEnabled = false;
 bool isPaused = false;
 bool isNeedConfirm = false;
 bool isHeatBlock = false;
+bool isNeedSave = false;
 String confirmMessage = "";
 
 // 0 - Нагрев до температуры внесение солода
@@ -229,46 +232,50 @@ void initHttpServer() {
 }
 
 void initSettings() {
-  String json = readFile(SD, "/settings.txt");
-  StaticJsonDocument<128> doc;
-  DeserializationError error = deserializeJson(doc, json);
+  File file = SD.open(pathSettings);
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, file);
   if (error) {
     Serial.print(F("deserializeJson() failed: "));
     Serial.println(error.c_str());
-    return;
   }
 
-  kp = doc['kp'];
-  ki = doc['ki'];
-  kd = doc['kd'];
-  sensorDiff = doc['sensorDiff'];
-  boilingPoint = doc['boilingPoint'];
-  ssid = doc['ssid'].as<String>();
-  password = doc['password'].as<String>();
+  kp = doc["kp"];
+  ki = doc["ki"];
+  kd = doc["kd"]; 
+  sensorDiff = doc["sensorDiff"] | 0;
+  boilingPoint = doc["boilingPoint"] | 0;
+  ssid = doc["ssid"] | "";
+  password = doc["password"] | "";
+
+  file.close();
 }
 
 void initState() {
-  String json = readFile(SD, "/state.txt");
-  StaticJsonDocument<128> doc;
-  DeserializationError error = deserializeJson(doc, json);
+  File file = SD.open(pathState);
+  StaticJsonDocument<1500> doc;
+  DeserializationError error = deserializeJson(doc, file);
+
   if (error) {
     Serial.print(F("deserializeJson() failed: "));
     Serial.println(error.c_str());
-    return;
   }
 
-  mode = doc["mode"].as<String>();
-  targetTemperature = doc["targetTemperature"];
-  heatLimit = doc["heatLimit"];
-  pumpLimit = doc["pumpLimit"];
-  isPumpEnabled = doc["isPumpEnabled"];
-  isPaused = doc["isPaused"];
-  isNeedConfirm = doc["isNeedConfirm"];
-  confirmMessage = doc["confirmMessage"].as<String>();
-  stage = doc["stage"];
-  step = doc["step"];
-  timeToEnd = doc["timeToEnd"];
+  mode = doc["mode"] | MODE_IDLE;
+  targetTemperature = doc["targetTemperature"] | 0;
+  heatLimit = doc["heatLimit"] | 100;
+  pumpLimit = doc["pumpLimit"] | 100;
+  isPumpEnabled = doc["isPumpEnabled"] | false;
+  isPaused = doc["isPaused"] | false;
+  isNeedConfirm = doc["isNeedConfirm"] | false;
+  confirmMessage = doc["confirmMessage"] | "";
+  stage = doc["stage"] | 0;
+  step = doc["step"] | 0;
+  timeToEnd = doc["timeToEnd"] | -1;
+  indexHops = doc["indexHops"] | 0;
   recipe = doc["recipe"];
+
+  file.close();
 }
 
 boolean initSdCard() {
@@ -387,7 +394,7 @@ void setWifiSettings() {
   } 
   
   doc.clear();
-  doc['ip'] = WiFi.localIP();
+  doc["ip"] = WiFi.localIP();
 
   serializeJson(doc, buffer);
   sendResponse(200, buffer);
@@ -406,7 +413,15 @@ void getSettings() {
 }
 
 boolean saveSettings() {
-  StaticJsonDocument<128> doc;
+  SD.remove(pathSettings);
+
+  File file = SD.open(pathSettings, FILE_WRITE);
+  if (!file) {
+    Serial.println(F("Failed to create file"));
+    return false;
+  }
+
+  StaticJsonDocument<256> doc;
   doc["kp"] = kp;
   doc["ki"] = ki;
   doc["kd"] = kd;
@@ -415,14 +430,28 @@ boolean saveSettings() {
   doc["ssid"] = ssid;
   doc["password"] = password;
 
-  serializeJson(doc, buffer);
-  return writeFile(SD, "/settings.txt", buffer);
+  if (serializeJson(doc, file) == 0) {
+    Serial.println(F("Failed to write to file"));
+    file.close();
+    return false;
+  }
+  
+  file.close();
+  return true;
 }
 
 void saveState() {
-  if (millis() - saveTimer < SAVE_DT) {
+  if (!isNeedSave && millis() - saveTimer < SAVE_DT) {
     return;
   }
+  SD.remove(pathState);
+
+  File file = SD.open(pathState, FILE_WRITE);
+  if (!file) {
+    Serial.println(F("Failed to create file"));
+    return;
+  }
+
   StaticJsonDocument<1500> doc;
   doc["mode"] = mode;
   doc["targetTemperature"] = targetTemperature;
@@ -435,11 +464,17 @@ void saveState() {
   doc["stage"] = stage;
   doc["step"] = step;
   doc["timeToEnd"] = timeToEnd;
+  doc["indexHops"] = indexHops;
   doc["recipe"] = recipe;
   saveTimer = millis();
 
-  serializeJson(doc, buffer);
-  writeFile(SD, "/state.txt", buffer);
+  if (serializeJson(doc, file) == 0) {
+    Serial.println(F("Failed to write to file"));
+    file.close();
+  }
+  
+  file.close();
+  isNeedSave = false;
 }
 
 void setHeatLimit() {
@@ -456,6 +491,8 @@ void setHeatLimit() {
     sendError(502, "Bad request");
     return;
   }
+
+  isNeedSave = true;
   heatLimit = doc["heatLimit"];
   sendResponse(200, "{}");
 }
@@ -475,6 +512,7 @@ void setPumpLimit() {
     return;
   }
 
+  isNeedSave = true;
   pumpLimit = doc["pumpLimit"];
   sendResponse(200, "{}");
 }
@@ -585,6 +623,8 @@ void setTargetTemperature()
     sendError(400, "Bad request");
     return;
   }
+
+  isNeedSave = true;
   targetTemperature = doc["targetTemperature"];
   sendResponse(200, "{}");
 }
@@ -593,6 +633,7 @@ void setConfirme() {
   isNeedConfirm = !isNeedConfirm;
   StaticJsonDocument<64> doc;
   char response[64];
+  isNeedSave = true;
   doc["result"] = isNeedConfirm;
   serializeJson(doc, response);
   sendResponse(200, response);
@@ -602,6 +643,7 @@ void togglePaused() {
   isPaused = !isPaused;
   StaticJsonDocument<64> doc;
   char response[64];
+  isNeedSave = true;
   doc["result"] = isPaused;
   serializeJson(doc, response);
   sendResponse(200, response);
@@ -611,6 +653,7 @@ void togglePump() {
   isPumpEnabled = !isPumpEnabled;
   StaticJsonDocument<64> doc;
   char response[64];
+  isNeedSave = true;
   doc["result"] = isPumpEnabled;
   serializeJson(doc, response);
   sendResponse(200, response);
@@ -632,6 +675,7 @@ void setRecipe() {
     return;
   }
 
+  isNeedSave = true;
   sendResponse(200, "{}");
 }
 
@@ -662,6 +706,7 @@ void setStart() {
     stage = 0;
   }
 
+  isNeedSave = true;
   sendResponse(200, "{}");
 }
 
@@ -672,6 +717,8 @@ void setStop()
   stage = 0;
   timeToEnd = -1;
   recipe.clear();
+
+  isNeedSave = true;
   sendResponse(200, "{}");
 }
 
@@ -692,7 +739,8 @@ void autoProgramm() {
         }
         timeToEnd = recipe[step]["time"].as<long>() * 1000 * 60;
         lastTime = millis();
-        stage++;                                                            
+        stage++;     
+        isNeedSave = true;                                                       
       }
     break;                                                        
     
@@ -703,6 +751,7 @@ void autoProgramm() {
         if (timeToEnd <= 0 && stage != 4) step++;
         lastTime = millis();
         stage++;
+        isNeedSave = true;
       }
     break;
 
@@ -717,6 +766,7 @@ void autoProgramm() {
           && (recipe[step]["time"].as<int>() * 60 * 1000) - (hops[indexHops].as<int>() * 60 * 1000) >= timeToEnd) {
           indexHops++;
           message = "Внесите хмель №" + indexHops;
+          isNeedSave = true;
         }
       } else if (recipe.size() > step + 1) {
         step++;
@@ -731,6 +781,7 @@ void autoProgramm() {
           hops = recipe[step]["hops"].as<JsonArray>();
           indexHops = 0;
         }
+        isNeedSave = true;
       } else if (recipe.size() == step + 1) {
         hops.clear();
         indexHops = 0;
@@ -738,6 +789,7 @@ void autoProgramm() {
         confirmMessage = "Завершение программы";
         timeToEnd = -1;
         stage++;
+        isNeedSave = true;
       } 
     break;
 
@@ -749,6 +801,7 @@ void autoProgramm() {
         timeToEnd = -1;
         step = 0;
         stage = 0;
+        isNeedSave = true;
       }
     break;
 
@@ -756,6 +809,7 @@ void autoProgramm() {
     mode = MODE_IDLE;
     targetTemperature = 0;
     timeToEnd = -1;
+    isNeedSave = true;
     break;
   }
 }
@@ -786,7 +840,7 @@ void pidControl() {
   }
 }
 
- void pumpControl() {
+void pumpControl() {
   if (!isPumpEnabled || isPaused || mode == MODE_IDLE || pumpLimit == 0) {
     dimmer.setState(OFF);
   } else {
