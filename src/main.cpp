@@ -735,7 +735,7 @@ void autoProgramm() {
       if (temperature >= constrain(targetTemperature, 0, boilingPoint)) {//60 60
         if (stage == 0) { 
           isNeedConfirm = true;
-          confirmMessage = "Внесите солод";
+          confirmMessage = "confirm.addMalt";
         }
         timeToEnd = recipe[step]["time"].as<long>() * 1000 * 60;
         lastTime = millis();
@@ -765,7 +765,7 @@ void autoProgramm() {
           && hops.size() > indexHops 
           && (recipe[step]["time"].as<int>() * 60 * 1000) - (hops[indexHops].as<int>() * 60 * 1000) >= timeToEnd) {
           indexHops++;
-          message = "Внесите хмель №" + indexHops;
+          message = "confirm.addHops" + indexHops;
           isNeedSave = true;
         }
       } else if (recipe.size() > step + 1) {
@@ -775,7 +775,7 @@ void autoProgramm() {
         stage = targetTemperature == 100 ? 4 : 2;
         if (stage == 4) {
           isNeedConfirm = true;
-          confirmMessage = "Отфильтруйте сусло";
+          confirmMessage = "confirm.extractSpentGrains";
         }
         if (recipe[step]["hops"]) {
           hops = recipe[step]["hops"].as<JsonArray>();
@@ -786,7 +786,7 @@ void autoProgramm() {
         hops.clear();
         indexHops = 0;
         isNeedConfirm = true;
-        confirmMessage = "Завершение программы";
+        confirmMessage = "confirm.finish";
         timeToEnd = -1;
         stage++;
         isNeedSave = true;
