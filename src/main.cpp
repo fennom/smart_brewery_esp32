@@ -1,33 +1,34 @@
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ArduinoJson.h>
+#include <WebServer.h>
+
+#include <RBDdimmer.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <RBDdimmer.h>
+
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
+#include "main.h"
+#include <uri/UriRegex.h>
+#include <WebSocketsServer.h>
 
-#define SD_PIN  5
-#define PWM_PIN  14
-#define ZC_PIN  27
-#define ONE_WIRE_BUS 15
-#define ONE_WIRE_BUS2 2
-#define HEAT_PIN 22
-#define PUMP_PIN 22
-
-const int SENSOR_PERIOD = 2000;
+const int SENSOR_PERIOD = 1250;
+const int SENSOR_DELAY = 2000;
 const int PID_DT = 1000;
 const int PUMP_DT = 100;
 const int SAVE_DT = 60000;
+const int WS_NOTIFY_DT = 1000;
 
 WebServer server(80);
-StaticJsonDocument<1024> jsonDocument;
+WebSocketsServer ws = WebSocketsServer(81);
+
 dimmerLamp dimmer(PWM_PIN, ZC_PIN);
 OneWire oneWire(ONE_WIRE_BUS);
 OneWire oneWire2(ONE_WIRE_BUS2);
 DallasTemperature sensors(&oneWire);
 DallasTemperature sensors2(&oneWire2);
+boolean sensorsRequested = false;
 
 String ssid = "";
 String password = "";
@@ -38,7 +39,6 @@ const String MODE_AUTO = "auto";
 const char *pathSettings = "/settings.txt";
 const char *pathState = "/state.txt";
 
-char buffer[1024];
 String mode = MODE_IDLE;
 float temperature = 0;
 float heatTemperature = 0;
@@ -49,7 +49,6 @@ long timeToEnd = -1;
 bool isPumpEnabled = false;
 bool isPaused = false;
 bool isNeedConfirm = false;
-bool isHeatBlock = false;
 bool isNeedSave = false;
 String confirmMessage = "";
 
@@ -68,12 +67,17 @@ unsigned long sensorTimer;
 unsigned long pidTimer;
 unsigned long pumpTimer;
 unsigned long saveTimer;
+unsigned long wsNotifyTimer;
 
 float kp = 0;
 float ki = 0;
 float kd = 0;
+float integral = 0;
+float prevErr = 0;
 int sensorDiff = 0;
 int boilingPoint = 0;
+
+uint16_t test;
 //int dim;
 
 StaticJsonDocument<1024> recipe;
@@ -82,47 +86,6 @@ int indexHops = 0;
 String message = "";
 
 //hw_timer_t *timer = NULL;
-
-boolean initSdCard();
-void initWifi();
-void initSettings();
-void initState();
-void initHttpServer();
-
-void sendError(int code, const char* message);
-void sendResponse(int code, const char* message);
-void sendOptions();
-
-void getInfo();
-void getSettings();
-
-void setHeatLimit();
-void setPumpLimit();
-void setTargetTemperature();  
-void setConfirme();
-void setRecipe();
-void setStart();
-void setStop();
-void setPidSettings();
-void setSensorDiff();
-void setBoilingPoint();
-void setWifiSettings();
-
-void togglePaused();
-void togglePump();
-
-boolean saveSettings();
-void saveState();
-
-String readFile(fs::FS &fs, const char * path);
-boolean writeFile(fs::FS &fs, const char * path, const char * message);
-void readTemperature();
-void autoProgramm();
-void pidControl();
-void pumpControl();
-
-//void IRAM_ATTR isr();
-//void IRAM_ATTR timerInterrupt();
 
 void setup() {
   Serial.begin(115200);
@@ -142,12 +105,15 @@ void setup() {
   initState();
   initWifi();
   initHttpServer();
+  initWebSocket();
   
   sensors.begin();
+  sensors2.begin();
   sensorTimer = millis();
   pidTimer = millis();
   pumpTimer = millis();
   saveTimer = millis();
+  wsNotifyTimer = millis();
 }
 
 void sendError(int code, const char* message) {
@@ -184,14 +150,20 @@ void initWifi() {
 
   Serial.println("Connection to ");
   Serial.println(ssid);
-  int connectionCount = 5;
+  int connectionCount = 150;
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED){
+  while (WiFi.status() != WL_CONNECTED && connectionCount > 0){
     delay(1000);
     Serial.println(".");
     connectionCount--;
-    return;
   } 
+
+  if (connectionCount < 1) {
+    ssid = "";
+    initWifi();
+    return;
+  }
+
   Serial.println("");
   Serial.println("WiFi connected..!");
   Serial.print("Got IP: ");  Serial.println(WiFi.localIP());
@@ -199,8 +171,7 @@ void initWifi() {
 
 void initHttpServer() {
   server.on("/v1/info", HTTP_GET, getInfo);
-  server.on("/v1/info", HTTP_OPTIONS, sendOptions);
-  server.on("/v1/wifi-settings", HTTP_OPTIONS, sendOptions);
+  
   server.on("/v1/wifi-settings", HTTP_POST, setWifiSettings);
   server.on("/v1/heat-limit", HTTP_OPTIONS, sendOptions);
   server.on("/v1/heat-limit", HTTP_POST, setHeatLimit);
@@ -227,8 +198,21 @@ void initHttpServer() {
   server.on("/v1/boiling-point", HTTP_POST, setBoilingPoint);
   server.on("/v1/boiling-point", HTTP_OPTIONS, sendOptions);
   server.on("/v1/settings", HTTP_GET, getSettings);
+
+  server.on("/v1/recipes", HTTP_GET, getRecipes);
+  server.on(UriRegex("^\\/v1\\/recipes\\/([0-9]+)$"), HTTP_GET, getRecipe);
+  server.on("/v1/recipes", HTTP_POST, addRecipe);
+  server.on(UriRegex("^\\/v1\\/recipes\\/([0-9]+)$"), HTTP_PUT, updateRecipe);
+  server.on(UriRegex("^\\/v1\\/recipes\\/([0-9]+)$"), HTTP_DELETE, deleteRecipe);
+
   server.begin();
   Serial.println("HTTP server started");
+}
+
+void initWebSocket() {
+  ws.begin();
+  ws.onEvent(onEvent);
+
 }
 
 void initSettings() {
@@ -244,7 +228,7 @@ void initSettings() {
   ki = doc["ki"];
   kd = doc["kd"]; 
   sensorDiff = doc["sensorDiff"] | 0;
-  boilingPoint = doc["boilingPoint"] | 0;
+  boilingPoint = doc["boilingPoint"] | 100;
   ssid = doc["ssid"] | "";
   password = doc["password"] | "";
 
@@ -304,6 +288,9 @@ boolean initSdCard() {
   uint64_t cardSize = SD.cardSize() / (1024 * 1024);
   Serial.printf("SD Card Size: %lluMB\n", cardSize);
 
+  if (!SD.mkdir("/recipes")) {
+    Serial.print(F("mkdir failed"));
+  }
   return true;
 }
 
@@ -342,25 +329,54 @@ boolean writeFile(fs::FS &fs, const char * path, const char * message) {
   return result;
 }
 
-void getInfo() {
-  jsonDocument.clear();
-  jsonDocument["mode"] = mode;
-  jsonDocument["temperature"] = temperature;
-  jsonDocument["heatTemperature"] = heatTemperature;
-  jsonDocument["targetTemperature"] = targetTemperature;
-  jsonDocument["heatLimit"] = heatLimit;
-  jsonDocument["pumpLimit"] = pumpLimit;
-  jsonDocument["isPumpEnabled"] = isPumpEnabled;
-  jsonDocument["isPaused"] = isPaused;
-  jsonDocument["isNeedConfirm"] = isNeedConfirm;
-  jsonDocument["confirmMessage"] = confirmMessage;
-  jsonDocument["stage"] = stage;
-  jsonDocument["step"] = step;
-  jsonDocument["timeToEnd"] = timeToEnd;
-  jsonDocument["recipe"] = recipe;
+void onEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+}
 
-  serializeJson(jsonDocument, buffer);
-  sendResponse(200, buffer);
+void getInfo() {
+  StaticJsonDocument<1024> doc;
+  doc["mode"] = mode;
+  doc["temperature"] = temperature;
+  doc["heatTemperature"] = heatTemperature;
+  doc["targetTemperature"] = targetTemperature;
+  doc["heatLimit"] = heatLimit;
+  doc["pumpLimit"] = pumpLimit;
+  doc["isPumpEnabled"] = isPumpEnabled;
+  doc["isPaused"] = isPaused;
+  doc["isNeedConfirm"] = isNeedConfirm;
+  doc["confirmMessage"] = confirmMessage;
+  doc["stage"] = stage;
+  doc["step"] = step;
+  doc["timeToEnd"] = timeToEnd;
+  doc["recipe"] = recipe;
+  doc["test"] = test;
+
+  char response[1024];
+  serializeJson(doc, response);
+  sendResponse(200, response);
+}
+
+void notifyClients() {
+  StaticJsonDocument<1024> doc;
+  
+  doc["mode"] = mode;
+  doc["temperature"] = temperature;
+  doc["heatTemperature"] = heatTemperature;
+  doc["targetTemperature"] = targetTemperature;
+  doc["heatLimit"] = heatLimit;
+  doc["pumpLimit"] = pumpLimit;
+  doc["isPumpEnabled"] = isPumpEnabled;
+  doc["isPaused"] = isPaused;
+  doc["isNeedConfirm"] = isNeedConfirm;
+  doc["confirmMessage"] = confirmMessage;
+  doc["stage"] = stage;
+  doc["step"] = step;
+  doc["timeToEnd"] = timeToEnd;
+  doc["recipe"] = recipe;
+  doc["test"] = test;
+
+  String response;
+  serializeJson(doc, response);
+  ws.broadcastTXT(response);
 }
 
 void setWifiSettings() {
@@ -396,20 +412,254 @@ void setWifiSettings() {
   doc.clear();
   doc["ip"] = WiFi.localIP();
 
-  serializeJson(doc, buffer);
-  sendResponse(200, buffer);
+  char response[128];
+  serializeJson(doc, response);
+  sendResponse(200, response);
 }
 
 void getSettings() {
   StaticJsonDocument<128> doc;
+
   doc["kp"] = kp;
   doc["ki"] = ki;
   doc["kd"] = kd;
   doc["sensorDiff"] = sensorDiff;
   doc["boilingPoint"] = boilingPoint;
 
-  serializeJson(doc, buffer);
-  sendResponse(200, buffer);
+  char response[128];
+  serializeJson(doc, response);
+  sendResponse(200, response);
+}
+
+void getRecipes() {
+  File file;
+  if (!SD.exists("/recipes/recipes.txt")) {
+    file = SD.open("/recipes/recipes.txt", FILE_WRITE, true);
+    if(file.print("[]")) {
+      Serial.println("Message write");
+    } else {
+      Serial.println("Write failed");
+    }
+    file.close();
+  } 
+
+  file = SD.open("/recipes/recipes.txt", FILE_READ);
+  StaticJsonDocument<1500> doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    SD.remove("/recipes/recipes.txt");
+    sendError(500, error.c_str());
+    return;
+  }
+  
+  char response[1500];
+  serializeJson(doc, response);
+  sendResponse(200, response);
+}
+
+void getRecipe() {
+  Serial.println("Start getRecipe");
+  String id = server.pathArg(0);
+  File fileRecipes = SD.open("/recipes/recipes.txt", FILE_READ);
+  StaticJsonDocument<1024> recipesDoc;
+  DeserializationError error = deserializeJson(recipesDoc, fileRecipes);
+  fileRecipes.close();
+  Serial.println("recipes ready");
+
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    sendError(500, error.c_str());
+    return;
+  }
+  Serial.println("find index");
+  JsonArray recipes = recipesDoc.as<JsonArray>();
+  int index = 0;
+  for (JsonVariant value : recipes) {
+      JsonObject doc = value.as<JsonObject>();
+      if (doc["id"].as<String>() == id) {
+        break;
+      }
+      index++;
+  }
+
+  Serial.println("find recipe by id");
+  File file = SD.open("/recipes/"+id+".txt");
+  StaticJsonDocument<1024> doc;
+  error = deserializeJson(doc, file);
+  file.close();
+
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    sendError(500, error.c_str());
+    return;
+  }
+
+  Serial.println("result");
+  StaticJsonDocument<1024> result;
+  result["id"] = recipes[index]["id"];
+  result["name"] = recipes[index]["name"];
+  result["temperaturePauses"] = doc;
+
+  char response[1024];
+  serializeJson(result, response);
+  sendResponse(200, response);
+}
+
+void addRecipe() {
+  if (server.hasArg("plain") == false) {
+    sendError(500, "Bad request");
+    return;
+  }
+
+  String body = server.arg("plain");
+  StaticJsonDocument<1024> json;
+  DeserializationError error = deserializeJson(json, body);
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    sendError(500, error.c_str());
+    return;
+  }
+
+  File fileRecipes = SD.open("/recipes/recipes.txt", FILE_READ);
+  StaticJsonDocument<1024> recipesDoc;
+  error = deserializeJson(recipesDoc, fileRecipes);
+  fileRecipes.close();
+
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    sendError(500, error.c_str());
+    return;
+  }
+  
+  JsonArray recipes = recipesDoc.as<JsonArray>();
+  int size = recipes.size();
+  String id = String(size + 1);
+
+  StaticJsonDocument<128> recipeInfo;
+  recipeInfo["id"] = size + 1;
+  recipeInfo["name"] = json["name"];
+  recipes.add(recipeInfo);
+
+  File file = SD.open("/recipes/"+id+".txt", FILE_WRITE, true);
+  if (serializeJson(json["temperaturePauses"], file) == 0) {
+    Serial.println(F("Failed to write to file"));
+    file.close();
+    sendError(500, "Failed to write to file");
+    return;
+  }
+  file.close();
+
+  fileRecipes = SD.open("/recipes/recipes.txt", FILE_WRITE);
+  if (serializeJson(recipes, fileRecipes) == 0) {
+    Serial.println(F("Failed to write to file"));
+    fileRecipes.close();
+    sendError(500, "Failed to write to file");
+    return;
+  }
+  fileRecipes.close();
+
+  char response[128];
+  serializeJson(recipeInfo, response);
+  sendResponse(200, response);
+}
+
+void updateRecipe() {
+  if (server.hasArg("plain") == false) {
+    sendError(500, "Bad request");
+    return;
+  }
+
+  String body = server.arg("plain");
+  StaticJsonDocument<1024> json;
+  DeserializationError error = deserializeJson(json, body);
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    sendError(500, error.c_str());
+    return;
+  }
+
+  File fileRecipes = SD.open("/recipes/recipes.txt", FILE_READ, true);
+  StaticJsonDocument<1024> recipesDoc;
+  error = deserializeJson(recipesDoc, fileRecipes);
+  fileRecipes.close();
+  JsonArray recipes = recipesDoc.as<JsonArray>();
+  String id = server.pathArg(0);
+
+  for (JsonVariant value : recipes) {
+      JsonObject d = value.as<JsonObject>();
+      if (d["id"].as<String>() == id) {
+        json["id"] = id;
+        d["name"] = json["name"];
+        break;
+      }
+  }
+
+  File file = SD.open("/recipes/"+id+".txt", FILE_WRITE);
+  if (serializeJson(json["temperaturePauses"], file) == 0) {
+    Serial.println(F("Failed to write to file"));
+    file.close();
+    sendError(500, "Failed to write to file");
+    return;
+  }
+  file.close();
+
+  fileRecipes = SD.open("/recipes/recipes.txt", FILE_WRITE, true);
+  if (serializeJson(recipes, fileRecipes) == 0) {
+    Serial.println(F("Failed to write to file"));
+    fileRecipes.close();
+    sendError(500, "Failed to write to file");
+    return;
+  }
+  fileRecipes.close();
+
+  char response[1024];
+  serializeJson(json, response);
+  sendResponse(200, response);
+}
+
+void deleteRecipe() {
+  StaticJsonDocument<1024> doc;
+
+  File fileRecipes = SD.open("/recipes/recipes.txt", FILE_READ);
+  StaticJsonDocument<1500> recipesDoc;
+  DeserializationError error = deserializeJson(recipesDoc, fileRecipes);
+  fileRecipes.close();
+
+  JsonArray recipes = recipesDoc.as<JsonArray>();
+  String id = server.pathArg(0);
+
+  int index = 0;
+  for (JsonVariant value : recipes) {
+      JsonObject doc = value.as<JsonObject>();
+      if (doc["id"].as<String>() == id) {
+        recipes.remove(index);
+        break;
+      }
+      index++;
+  }
+
+  bool isDeleted = SD.remove("/recipes/"+id+".txt");
+  fileRecipes = SD.open("/recipes/recipes.txt", FILE_WRITE);
+  if (!isDeleted || serializeJson(recipes, fileRecipes) == 0) {
+    Serial.println(F("Failed to write to file"));
+    fileRecipes.close();
+    sendError(500, "Failed to write to file");
+    return;
+  }
+  fileRecipes.close();
+
+  char response[1024];
+  serializeJson(doc, response);
+  sendResponse(200, response);
 }
 
 boolean saveSettings() {
@@ -482,43 +732,44 @@ void setHeatLimit() {
     sendError(500, "Bad request");
     return;
   }
+
   String body = server.arg("plain");
-  StaticJsonDocument<128> doc;
-  DeserializationError error = deserializeJson(doc, body);
+  StaticJsonDocument<128> json;
+  DeserializationError error = deserializeJson(json, body);
   if (error) {
     Serial.print(F("deserializeJson() failed: "));
     Serial.println(error.c_str());
-    sendError(502, "Bad request");
+    sendError(500, error.c_str());
     return;
   }
 
   isNeedSave = true;
-  heatLimit = doc["heatLimit"];
+  heatLimit = json["heatLimit"];
   sendResponse(200, "{}");
 }
 
 void setPumpLimit() {
   if (server.hasArg("plain") == false) {
-    sendError(400, "Bad request");
+    sendError(500, "Bad request");
     return;
   }
+
   String body = server.arg("plain");
-  StaticJsonDocument<128> doc;
-  DeserializationError error = deserializeJson(doc, body);
+  StaticJsonDocument<128> json;
+  DeserializationError error = deserializeJson(json, body);
   if (error) {
     Serial.print(F("deserializeJson() failed: "));
     Serial.println(error.c_str());
-    sendError(400, "Bad request");
+    sendError(500, error.c_str());
     return;
   }
 
   isNeedSave = true;
-  pumpLimit = doc["pumpLimit"];
+  pumpLimit = json["pumpLimit"];
   sendResponse(200, "{}");
 }
 
-void setPidSettings() 
-{
+void setPidSettings() {
   if (server.hasArg("plain") == false) {
     sendError(500, "Bad request");
     return;
@@ -539,15 +790,15 @@ void setPidSettings()
   kd = doc["kd"];
 
   if (saveSettings()) {
-    serializeJson(doc, buffer);
-    sendResponse(200, buffer);
+    char response[128];
+    serializeJson(doc, response);
+    sendResponse(200, response);
   } else {
     sendError(500, "Internal error");
   }
 }
 
-void setSensorDiff() 
-{
+void setSensorDiff() {
   if (server.hasArg("plain") == false) {
     sendError(500, "Bad request");
     return;
@@ -566,8 +817,9 @@ void setSensorDiff()
   sensorDiff = doc["sensorDiff"].as<int>();
 
   if (saveSettings()) {
-    serializeJson(doc, buffer);
-    sendResponse(200, buffer);
+    char response[128];
+    serializeJson(doc, response);
+    sendResponse(200, response);
   } else {
     sendError(500, "Internal error");
   }
@@ -593,8 +845,9 @@ void setBoilingPoint()
   boilingPoint = doc["boilingPoint"];
 
   if (saveSettings()) {
-    serializeJson(doc, buffer);
-    sendResponse(200, buffer);
+    char response[128];
+    serializeJson(doc, response);
+    sendResponse(200, response);
   } else {
     sendError(500, "Internal error");
   }
@@ -694,7 +947,6 @@ void setStart() {
   }
 
   mode = doc["mode"].as<String>();
-  sensorDiff = doc["sensorDiff"].as<int>();
   
   if (mode == MODE_AUTO) {
     if (recipe.isNull()) {
@@ -726,6 +978,8 @@ void autoProgramm() {
   if (isPaused || mode != MODE_AUTO) {
     return;
   }
+  float currentTemperature;
+
   switch (stage) { 
     case 0:
     case 2:
@@ -763,16 +1017,15 @@ void autoProgramm() {
         lastTime = millis();
         if (hops.size() > 0 
           && hops.size() > indexHops 
-          && (recipe[step]["time"].as<int>() * 60 * 1000) - (hops[indexHops].as<int>() * 60 * 1000) >= timeToEnd) {
+          && ((recipe[step]["time"].as<int>() - hops[indexHops].as<int>()) * 60 * 1000) >= timeToEnd) {
           indexHops++;
           message = "confirm.addHops" + indexHops;
+          isNeedConfirm = true;
           isNeedSave = true;
         }
       } else if (recipe.size() > step + 1) {
         step++;
-        targetTemperature = recipe[step]["temperature"].as<float>();
-        heatLimit = recipe[step]["power"].as<int>();
-        stage = targetTemperature == 100 ? 4 : 2;
+        stage = recipe[step]["temperature"].as<float>() == 100 ? 4 : 2;
         if (stage == 4) {
           isNeedConfirm = true;
           confirmMessage = "confirm.extractSpentGrains";
@@ -784,6 +1037,7 @@ void autoProgramm() {
         isNeedSave = true;
       } else if (recipe.size() == step + 1) {
         hops.clear();
+        targetTemperature = 0;
         indexHops = 0;
         isNeedConfirm = true;
         confirmMessage = "confirm.finish";
@@ -796,9 +1050,7 @@ void autoProgramm() {
     case 7:
       if (!isNeedConfirm) {
         mode = MODE_IDLE;
-        targetTemperature = 0;
         confirmMessage = "";
-        timeToEnd = -1;
         step = 0;
         stage = 0;
         isNeedSave = true;
@@ -815,23 +1067,14 @@ void autoProgramm() {
 }
 
 void pidControl() {
-  //isHeatBlock = (heatTemperature - targetTemperature > 5) || ()
-  if (isHeatBlock || isPaused || mode == MODE_IDLE) {
-    if (isHeatBlock && heatTemperature - targetTemperature < 1) {
-      isHeatBlock = false;
-    }
+  if (isPaused || mode == MODE_IDLE || (sensorDiff > 0 && heatTemperature - temperature >= sensorDiff)) {
     analogWrite(HEAT_PIN, 0);
     return;
   }
+
   if (millis() - pidTimer >= PID_DT) {
-    if (heatTemperature - targetTemperature >= sensorDiff) {
-      isHeatBlock = true;
-      return;
-    }
     int maxOut = map(heatLimit, 0, 100, 0, 255);
     float err = targetTemperature - temperature;
-    static float integral = 0, prevErr = 0;
-    integral += err * PID_DT;
     integral = constrain(integral + (float)err * PID_DT * ki, 0, maxOut);
     float D = (err - prevErr) / PID_DT;
     prevErr = err;
@@ -876,16 +1119,28 @@ void pumpControl() {
 
 void readTemperature() {
   if (millis() - sensorTimer >= SENSOR_PERIOD) {
-    sensors.requestTemperatures(); 
-    heatTemperature = sensors.getTempCByIndex(0);
-
-    sensors2.requestTemperatures(); 
-    temperature = sensors2.getTempCByIndex(0);
+    if (!sensorsRequested) {
+      sensors.requestTemperatures(); 
+      sensors2.requestTemperatures(); 
+      sensorsRequested = true;
+    }
+    
+    if (millis() - sensorTimer >= SENSOR_DELAY) {
+      heatTemperature = sensors.getTempCByIndex(0);
+      temperature = sensors2.getTempCByIndex(0);
+      sensorTimer = millis();
+      sensorsRequested = false;
+    }
   }
 }
 
 void loop() {
   server.handleClient();
+  ws.loop();
+  if (millis() - wsNotifyTimer >= WS_NOTIFY_DT) {
+    notifyClients();
+    wsNotifyTimer = millis();
+  }
   readTemperature();
   autoProgramm();
   pidControl();
