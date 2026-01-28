@@ -263,6 +263,8 @@ void initState() {
 }
 
 boolean initSdCard() {
+  SPI.begin(18, 19, 21, SD_PIN);
+
   if(!SD.begin(SD_PIN)) {
     Serial.println("Card Mount Failed");
     return false;
@@ -408,13 +410,17 @@ void setWifiSettings() {
       break;
     }
   } 
-  
+
   doc.clear();
   doc["ip"] = WiFi.localIP();
 
-  char response[128];
-  serializeJson(doc, response);
-  sendResponse(200, response);
+  if (saveSettings()) {
+    char response[128];
+    serializeJson(doc, response);
+    sendResponse(200, response);
+  } else {
+    sendError(500, "Internal error");
+  }
 }
 
 void getSettings() {
@@ -1018,8 +1024,8 @@ void autoProgramm() {
         if (hops.size() > 0 
           && hops.size() > indexHops 
           && ((recipe[step]["time"].as<int>() - hops[indexHops].as<int>()) * 60 * 1000) >= timeToEnd) {
+          message = "confirm.addHops";
           indexHops++;
-          message = "confirm.addHops" + indexHops;
           isNeedConfirm = true;
           isNeedSave = true;
         }
